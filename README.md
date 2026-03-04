@@ -6,7 +6,7 @@
 
 This demo showcases how to use the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) to interact through voice with a 3D scene (built with [Spline](https://spline.design/)), in this case a scene representing the solar system.
 
-It is implemented using the [Realtime + WebRTC integration](https://platform.openai.com/docs/guides/realtime-webrtc) and uses [Function Calling](https://platform.openai.com/docs/guides/realtime-model-capabilities#function-calling) to trigger actions in the app.
+It is implemented using the [Realtime + WebRTC integration](https://developers.openai.com/api/docs/guides/realtime-webrtc/) and uses [function calling](https://developers.openai.com/api/docs/guides/realtime-conversations/) to trigger actions in the app.
 
 ![screenshot](./public/screenshot.jpg)
 
@@ -123,7 +123,7 @@ You can also update:
 
 - The instructions in the `lib/config.ts` file to change the behavior of the model
 - The tools the model has access to in the `lib/config.ts` file
-- The [voice](https://platform.openai.com/docs/api-reference/realtime-sessions/create#realtime-sessions-create-voice) in the `lib/constants.ts` file
+- The [voice](https://developers.openai.com/api/docs/guides/realtime-conversations/#voice-options) in the `lib/config.ts` file
 
 ## License
 
