@@ -5,11 +5,19 @@ import Scene from "@/components/scene";
 import Logs from "@/components/logs";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { INSTRUCTIONS, TOOLS } from "@/lib/config";
-import { BASE_URL, MODEL } from "@/lib/constants";
+import { REALTIME_CALLS_URL } from "@/lib/constants";
 
 type ToolCallOutput = {
   response: string;
   [key: string]: any;
+};
+
+type RealtimeClientSecret = {
+  value: string;
+  expires_at: number;
+  session?: {
+    id?: string;
+  };
 };
 
 export default function App() {
@@ -28,52 +36,67 @@ export default function App() {
 
   // Start a new realtime session
   async function startSession() {
+    let pc: RTCPeerConnection | null = null;
+    let stream: MediaStream | null = null;
+
     try {
       if (!isSessionStarted) {
         setIsSessionStarted(true);
-        // Get an ephemeral session token
-        const session = await fetch("/api/session").then((response) =>
-          response.json()
-        );
-        const sessionToken = session.client_secret.value;
-        const sessionId = session.id;
 
-        console.log("Session id:", sessionId);
+        const sessionResponse = await fetch("/api/session");
+        if (!sessionResponse.ok) {
+          throw new Error(await sessionResponse.text());
+        }
+
+        const session: RealtimeClientSecret = await sessionResponse.json();
+        const sessionToken = session.value;
+        const sessionId = session.session?.id;
+
+        if (!sessionToken) {
+          throw new Error("Realtime client secret is missing from /api/session");
+        }
+
+        if (sessionId) {
+          console.log("Session id:", sessionId);
+        }
 
         // Create a peer connection
-        const pc = new RTCPeerConnection();
+        pc = new RTCPeerConnection();
+        const activePeerConnection = pc;
 
         // Set up to play remote audio from the model
         if (!audioElement.current) {
           audioElement.current = document.createElement("audio");
         }
         audioElement.current.autoplay = true;
-        pc.ontrack = (e) => {
+        activePeerConnection.ontrack = (e) => {
           if (audioElement.current) {
             audioElement.current.srcObject = e.streams[0];
           }
         };
 
-        const stream = await navigator.mediaDevices.getUserMedia({
+        stream = await navigator.mediaDevices.getUserMedia({
           audio: true,
         });
+        const activeStream = stream;
+        setAudioStream(activeStream);
 
-        stream.getTracks().forEach((track) => {
-          const sender = pc.addTrack(track, stream);
+        activeStream.getTracks().forEach((track) => {
+          const sender = activePeerConnection.addTrack(track, activeStream);
           if (sender) {
             tracks.current = [...(tracks.current || []), sender];
           }
         });
 
         // Set up data channel for sending and receiving events
-        const dc = pc.createDataChannel("oai-events");
+        const dc = activePeerConnection.createDataChannel("oai-events");
         setDataChannel(dc);
 
         // Start the session using the Session Description Protocol (SDP)
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        const offer = await activePeerConnection.createOffer();
+        await activePeerConnection.setLocalDescription(offer);
 
-        const sdpResponse = await fetch(`${BASE_URL}?model=${MODEL}`, {
+        const sdpResponse = await fetch(REALTIME_CALLS_URL, {
           method: "POST",
           body: offer.sdp,
           headers: {
@@ -82,16 +105,28 @@ export default function App() {
           },
         });
 
+        if (!sdpResponse.ok) {
+          throw new Error(await sdpResponse.text());
+        }
+
         const answer: RTCSessionDescriptionInit = {
           type: "answer",
           sdp: await sdpResponse.text(),
         };
-        await pc.setRemoteDescription(answer);
+        await activePeerConnection.setRemoteDescription(answer);
 
-        peerConnection.current = pc;
+        peerConnection.current = activePeerConnection;
       }
     } catch (error) {
       console.error("Error starting session:", error);
+      stream?.getTracks().forEach((track) => track.stop());
+      pc?.close();
+      tracks.current = null;
+      setAudioStream(null);
+      setDataChannel(null);
+      setIsSessionStarted(false);
+      setIsSessionActive(false);
+      setIsListening(false);
     }
   }
 
@@ -107,6 +142,7 @@ export default function App() {
     setIsSessionStarted(false);
     setIsSessionActive(false);
     setDataChannel(null);
+    setToolCall(null);
     peerConnection.current = null;
     if (audioStream) {
       audioStream.getTracks().forEach((track) => track.stop());
@@ -114,6 +150,10 @@ export default function App() {
     setAudioStream(null);
     setIsListening(false);
     audioTransceiver.current = null;
+    tracks.current = null;
+    if (audioElement.current) {
+      audioElement.current.srcObject = null;
+    }
   }
 
   // Grabs a new mic track and replaces the placeholder track in the transceiver
@@ -176,7 +216,7 @@ export default function App() {
   // Send a message to the model
   const sendClientEvent = useCallback(
     (message: any) => {
-      if (dataChannel) {
+      if (dataChannel?.readyState === "open") {
         message.event_id = message.event_id || crypto.randomUUID();
         dataChannel.send(JSON.stringify(message));
       } else {
@@ -235,34 +275,59 @@ export default function App() {
     }
 
     if (dataChannel) {
-      // Append new server events to the list
-      dataChannel.addEventListener("message", (e) => {
+      const handleMessage = (e: MessageEvent) => {
         const event = JSON.parse(e.data);
+
+        if (event.type === "error") {
+          console.error("Realtime error:", event);
+          setLogs((prev) => [event, ...prev]);
+          return;
+        }
+
         if (event.type === "response.done") {
-          const output = event.response.output[0];
-          setLogs((prev) => [output, ...prev]);
-          if (output?.type === "function_call") {
-            handleToolCall(output);
+          const outputs = event.response?.output ?? [];
+          const functionCall = outputs.find(
+            (output: any) => output?.type === "function_call"
+          );
+
+          if (outputs.length > 0) {
+            setLogs((prev) => [...outputs, ...prev]);
+          }
+
+          if (functionCall) {
+            void handleToolCall(functionCall);
           }
         }
-      });
+      };
 
-      // Set session active when the data channel is opened
-      dataChannel.addEventListener("open", () => {
+      const handleOpen = () => {
         setIsSessionActive(true);
         setIsListening(true);
         setLogs([]);
-        // Send session config
+
         const sessionUpdate = {
           type: "session.update",
           session: {
+            type: "realtime",
             tools: TOOLS,
             instructions: INSTRUCTIONS,
           },
         };
+
         sendClientEvent(sessionUpdate);
         console.log("Session update sent:", sessionUpdate);
-      });
+      };
+
+      // Append new server events to the list
+      dataChannel.addEventListener("message", handleMessage);
+
+      // Set session active when the data channel is opened
+      dataChannel.addEventListener("open", handleOpen);
+
+      return () => {
+        dataChannel.removeEventListener("message", handleMessage);
+        dataChannel.removeEventListener("open", handleOpen);
+      };
     }
   }, [dataChannel, sendClientEvent]);
 
@@ -277,6 +342,8 @@ export default function App() {
   };
 
   const handleMicToggleClick = async () => {
+    if (!isSessionActive) return;
+
     if (isListening) {
       console.log("Stopping microphone.");
       stopRecording();
